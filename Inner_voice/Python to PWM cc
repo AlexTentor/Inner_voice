@@ -1,0 +1,116 @@
+import serial
+import time
+import mido
+import glob
+import threading
+from queue import Queue
+from collections import defaultdict
+
+class MIDIMotoController:
+    def __init__(self):
+        self.setup_midi()
+        self.serial = self.connect_to_esp32()
+        self.message_queue = Queue()
+        self.serial_lock = threading.Lock()
+        self.motor_speeds = defaultdict(int)
+    
+    def setup_midi(self):
+        input_ports = mido.get_input_names()
+        print("Available MIDI ports:", input_ports)
+        
+        iac_port = None
+        for port in input_ports:
+            if 'IAC' in port:
+                iac_port = port
+                break
+        
+        if iac_port is None:
+            raise RuntimeError("IAC Driver not found")
+        
+        self.midi_in = mido.open_input(iac_port)
+        print(f"Connected to MIDI port: {iac_port}")
+
+    def connect_to_esp32(self):
+        patterns = ['/dev/cu.usbserial*', '/dev/cu.SLAB*', '/dev/cu.wchusbserial*']
+        
+        for pattern in patterns:
+            ports = glob.glob(pattern)
+            if ports:
+                try:
+                    serial_connection = serial.Serial(ports[0], 115200, timeout=1)
+                    print(f"Connected to ESP32 on port: {ports[0]}")
+                    time.sleep(2)
+                    return serial_connection
+                except serial.SerialException as e:
+                    print(f"Error connecting to {ports[0]}: {e}")
+        
+        raise RuntimeError("No ESP32 found")
+
+    def process_midi_message(self, message):
+        if message.type == 'control_change':
+            if 1 <= message.control <= 92:  # CC 1-4 correspond to motors 0-3
+                motor_number = message.control - 1
+                speed = int((message.value / 127) * 255)  # Convert CC value (0-127) to PWM (0-255)
+                self.motor_speeds[motor_number] = speed
+                self.message_queue.put((motor_number, speed))
+
+    def send_motor_command(self, motor_number, speed):
+        with self.serial_lock:
+            command = f"m{motor_number} {speed}\n"
+            self.serial.write(command.encode())
+            print(f"Motor {motor_number} speed: {speed}")
+
+    def process_message_queue(self):
+        while not self.message_queue.empty():
+            motor_number, speed = self.message_queue.get()
+            self.send_motor_command(motor_number, speed)
+
+    def midi_listener(self):
+        while True:
+            for message in self.midi_in.iter_pending():
+                self.process_midi_message(message)
+            time.sleep(0.0001)
+
+    def queue_processor(self):
+        while True:
+            if not self.message_queue.empty():
+                self.process_message_queue()
+            time.sleep(0.001)
+
+    def run(self):
+        print("\nListening for MIDI CC messages...")
+        print("Use CC 1-4 to control motors 0-3")
+        print("Press Ctrl+C to exit")
+        
+        midi_thread = threading.Thread(target=self.midi_listener, daemon=True)
+        midi_thread.start()
+        
+        processor_thread = threading.Thread(target=self.queue_processor, daemon=True)
+        processor_thread.start()
+        
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nExiting...")
+
+    def close(self):
+        try:
+            if hasattr(self, 'midi_in'):
+                self.midi_in.close()
+            if hasattr(self, 'serial'):
+                self.serial.close()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+
+if __name__ == "__main__":
+    try:
+        controller = MIDIMotoController()
+        controller.run()
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        if 'controller' in locals():
+            controller.close()
