@@ -1,0 +1,161 @@
+import serial
+import time
+import mido
+import glob
+import threading
+from queue import Queue
+from collections import defaultdict
+
+class MIDIRelayController:
+    def __init__(self):
+        """Initialize MIDI input and serial connection"""
+        # List and connect to IAC Driver
+        self.setup_midi()
+        
+        # Set up serial connection - auto-detect ESP32 port
+        self.serial = self.connect_to_esp32()
+        
+        # Message queue for handling multiple simultaneous notes
+        self.message_queue = Queue()
+        
+        # Track active notes
+        self.active_notes = defaultdict(bool)
+        
+        # Lock for serial communication
+        self.serial_lock = threading.Lock()
+        
+    def setup_midi(self):
+        """Set up MIDI input through IAC Driver"""
+        input_ports = mido.get_input_names()
+        print("Available MIDI ports:", input_ports)
+        
+        iac_port = None
+        for port in input_ports:
+            if 'IAC' in port:
+                iac_port = port
+                break
+        
+        if iac_port is None:
+            raise RuntimeError("IAC Driver not found. Please enable it in Audio MIDI Setup")
+        
+        self.midi_in = mido.open_input(iac_port)
+        print(f"Connected to MIDI port: {iac_port}")
+    
+    def connect_to_esp32(self):
+        """Auto-detect and connect to ESP32 port on Mac"""
+        patterns = [
+            '/dev/cu.usbserial*',
+            '/dev/cu.SLAB*',
+            '/dev/cu.wchusbserial*'
+        ]
+        
+        for pattern in patterns:
+            ports = glob.glob(pattern)
+            if ports:
+                try:
+                    serial_connection = serial.Serial(ports[0], 115200, timeout=1)
+                    print(f"Connected to ESP32 on port: {ports[0]}")
+                    time.sleep(2)  # Wait for ESP32 to reset
+                    return serial_connection
+                except serial.SerialException as e:
+                    print(f"Error connecting to {ports[0]}: {e}")
+        
+        raise RuntimeError("No ESP32 found. Please check connection")
+    
+    def process_midi_message(self, message):
+        """Process incoming MIDI message and add to queue"""
+        if message.type == 'note_on':
+            relay_number = (message.note % 4) + 1
+            # Add both note and velocity to distinguish between note on/off
+            self.message_queue.put((relay_number, message.velocity > 0))
+            self.active_notes[message.note] = message.velocity > 0
+    
+    def send_relay_command(self, relay_number):
+        """Send command for a single relay"""
+        with self.serial_lock:
+            self.serial.write(str(relay_number).encode())
+            print(f"Activated relay {relay_number}")
+    
+    def activate_relays_simultaneously(self, relay_numbers):
+        """Activate multiple relays simultaneously using threads"""
+        threads = []
+        for relay in relay_numbers:
+            thread = threading.Thread(target=self.send_relay_command, args=(relay,))
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all commands to complete
+        for thread in threads:
+            thread.join()
+        
+        print(f"Activated relays: {relay_numbers}")
+        print()
+    
+    def process_message_queue(self):
+        """Process all pending messages in the queue"""
+        to_activate = set()
+        
+        # Collect all pending messages
+        while not self.message_queue.empty():
+            relay_number, is_on = self.message_queue.get()
+            if is_on:
+                to_activate.add(relay_number)
+        
+        # Activate collected relays simultaneously
+        if to_activate:
+            self.activate_relays_simultaneously(list(to_activate))
+    
+    def midi_listener(self):
+        """Thread function to listen for MIDI messages"""
+        while True:
+            for message in self.midi_in.iter_pending():
+                self.process_midi_message(message)
+            time.sleep(0.0001)
+    
+    def queue_processor(self):
+        """Thread function to process the message queue"""
+        while True:
+            if not self.message_queue.empty():
+                self.process_message_queue()
+            time.sleep(0.001)
+    
+    def run(self):
+        """Main function to start all threads"""
+        print("\nListening for MIDI notes...")
+        print("Press Ctrl+C to exit")
+        
+        # Start MIDI listener thread
+        midi_thread = threading.Thread(target=self.midi_listener, daemon=True)
+        midi_thread.start()
+        
+        # Start queue processor thread
+        processor_thread = threading.Thread(target=self.queue_processor, daemon=True)
+        processor_thread.start()
+        
+        # Keep main thread alive
+        try:
+            while True:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nExiting...")
+    
+    def close(self):
+        """Clean up MIDI and serial connections"""
+        self.midi_in.close()
+        self.serial.close()
+
+# Example usage
+if __name__ == "__main__":
+    try:
+        controller = MIDIRelayController()
+        controller.run()
+            
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    finally:
+        if 'controller' in locals():
+            controller.close()

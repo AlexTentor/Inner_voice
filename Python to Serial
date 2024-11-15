@@ -1,0 +1,104 @@
+import serial
+import time
+import mido
+import glob
+
+class MIDIRelayController:
+    def __init__(self):
+        """Initialize MIDI input and serial connection"""
+        # List and connect to IAC Driver
+        self.setup_midi()
+        
+        # Set up serial connection - auto-detect Arduino port on Mac
+        self.serial = self.connect_to_arduino()
+        
+    def setup_midi(self):
+        """Set up MIDI input through IAC Driver"""
+        # List available MIDI input ports
+        input_ports = mido.get_input_names()
+        
+        # Find IAC Driver port
+        iac_port = None
+        for port in input_ports:
+            if 'IAC' in port:
+                iac_port = port
+                break
+        
+        if iac_port is None:
+            raise RuntimeError("IAC Driver not found. Please enable it in Audio MIDI Setup")
+        
+        # Connect to IAC Driver
+        self.midi_in = mido.open_input(iac_port)
+        print(f"Connected to MIDI port: {iac_port}")
+    
+    def connect_to_arduino(self):
+        """Auto-detect and connect to Arduino port on Mac"""
+        # Arduino USB port patterns on Mac
+        patterns = [
+            '/dev/cu.usbmodem1201',
+            '/dev/cu.usbserial*'
+        ]
+        
+        # Search for Arduino port
+        for pattern in patterns:
+            ports = glob.glob(pattern)
+            if ports:
+                try:
+                    serial_connection = serial.Serial(ports[0], 115200, timeout=1)
+                    print(f"Connected to Arduino on port: {ports[0]}")
+                    time.sleep(2)  # Wait for Arduino to reset
+                    return serial_connection
+                except serial.SerialException as e:
+                    print(f"Error connecting to {ports[0]}: {e}")
+        
+        raise RuntimeError("No Arduino found. Please check connection")
+    
+    def process_midi_message(self, message):
+        """Process incoming MIDI message"""
+        # Check if it's a note_on message with velocity > 0
+        if message.type == 'note_on' and message.velocity > 0:
+            # Convert MIDI note to relay number (1-8)
+            relay_number = (message.note % 6 ) + 1
+            print(f"MIDI Note: {message.note} -> Relay: {relay_number}")
+            self.activate_relay(relay_number)
+    
+    def activate_relay(self, relay_number):
+        """Activate a specific relay"""
+        if 1 <= relay_number <= 8:
+            self.serial.write(bytes([relay_number]))
+            print(f"Activated relay {relay_number}")
+            print()
+        else:
+            print("Invalid relay number. Please use 1-8")
+    
+    def run(self):
+        """Main loop to receive MIDI messages"""
+        print("\nListening for MIDI notes...")
+        print("Press Ctrl+C to exit")
+        
+        while True:
+            # Receive MIDI messages
+            for message in self.midi_in.iter_pending():
+                self.process_midi_message(message)
+            time.sleep(0.0001)  # Small delay to prevent CPU overuse
+    
+    def close(self):
+        """Clean up MIDI and serial connections"""
+        self.midi_in.close()
+        self.serial.close()
+
+# Example usage
+if __name__ == "__main__":
+    try:
+        controller = MIDIRelayController()
+        controller.run()
+            
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    finally:
+        if 'controller' in locals():
+            controller.close()
